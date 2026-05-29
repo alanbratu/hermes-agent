@@ -49,7 +49,8 @@ export type ConnectionState =
   | "connecting"
   | "open"
   | "closed"
-  | "error";
+  | "error"
+  | "reconnecting";
 
 interface Pending {
   resolve: (v: unknown) => void;
@@ -58,6 +59,9 @@ interface Pending {
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+const RECONNECT_MAX_RETRIES = 10;
+const RECONNECT_BASE_DELAY_MS = 1_000;
+const RECONNECT_MAX_DELAY_MS = 30_000;
 
 /** Wildcard listener key: subscribe to every event regardless of type. */
 const ANY = "*";
@@ -70,8 +74,19 @@ export class GatewayClient {
   private _state: ConnectionState = "idle";
   private stateListeners = new Set<(s: ConnectionState) => void>();
 
+  /** Reconnection state */
+  private _retryCount = 0;
+  private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private _intentionalClose = false;
+  /** Stashed auth param so reconnect can reuse credentials. */
+  private _lastAuth: { name: string; value: string } | null = null;
+
   get state(): ConnectionState {
     return this._state;
+  }
+
+  get retryCount(): number {
+    return this._retryCount;
   }
 
   private setState(s: ConnectionState) {
@@ -108,40 +123,37 @@ export class GatewayClient {
   async connect(token?: string): Promise<void> {
     if (this._state === "open" || this._state === "connecting") return;
     this.setState("connecting");
+    this._intentionalClose = false;
 
-    // Gated mode: legacy ``?token=`` is rejected by ``_ws_auth_ok``; the
-    // SPA must fetch a single-use ticket via /api/auth/ws-ticket instead.
-    // Explicit ``token`` overrides the gate check (test-only path).
-    let authParamName: string;
-    let authParamValue: string;
+    // Resolve auth params (same logic as before, but stash for reconnect).
     if (token) {
-      authParamName = "token";
-      authParamValue = token;
+      this._lastAuth = { name: "token", value: token };
     } else if (window.__HERMES_AUTH_REQUIRED__) {
       const { ticket } = await getWsTicket();
-      authParamName = "ticket";
-      authParamValue = ticket;
+      this._lastAuth = { name: "ticket", value: ticket };
     } else {
-      authParamName = "token";
-      authParamValue = window.__HERMES_SESSION_TOKEN__ ?? "";
-      if (!authParamValue) {
+      const value = window.__HERMES_SESSION_TOKEN__ ?? "";
+      if (!value) {
         this.setState("error");
         throw new Error(
           "Session token not available — page must be served by the Hermes dashboard",
         );
       }
+      this._lastAuth = { name: "token", value };
     }
 
+    await this._doOpen();
+  }
+
+  /** Open the actual WebSocket using stashed auth (internal). */
+  private async _doOpen(): Promise<void> {
+    const auth = this._lastAuth!;
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(
-      `${scheme}//${location.host}${HERMES_BASE_PATH}/api/ws?${authParamName}=${encodeURIComponent(authParamValue)}`,
+      `${scheme}//${location.host}${HERMES_BASE_PATH}/api/ws?${auth.name}=${encodeURIComponent(auth.value)}`,
     );
     this.ws = ws;
 
-    // Register message + close BEFORE awaiting open — the server emits
-    // `gateway.ready` immediately after accept, so a listener attached
-    // after the open promise resolves can race past it and drop the
-    // initial skin payload.
     ws.addEventListener("message", (ev) => {
       try {
         this.dispatch(JSON.parse(ev.data));
@@ -151,13 +163,19 @@ export class GatewayClient {
     });
 
     ws.addEventListener("close", () => {
+      const wasOpen = this._state === "open";
       this.setState("closed");
       this.rejectAllPending(new Error("WebSocket closed"));
+
+      if (!this._intentionalClose && wasOpen && this._retryCount < RECONNECT_MAX_RETRIES) {
+        this._scheduleReconnect();
+      }
     });
 
     await new Promise<void>((resolve, reject) => {
       const onOpen = () => {
         ws.removeEventListener("error", onError);
+        this._retryCount = 0; // reset on successful open
         this.setState("open");
         resolve();
       };
@@ -171,9 +189,39 @@ export class GatewayClient {
     });
   }
 
+  private _scheduleReconnect() {
+    if (this._reconnectTimer) return;
+    this._retryCount += 1;
+    this.setState("reconnecting");
+
+    const delay = Math.min(
+      RECONNECT_BASE_DELAY_MS * Math.pow(2, this._retryCount - 1),
+      RECONNECT_MAX_DELAY_MS,
+    );
+
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      // Only reconnect if still not intentionally closed.
+      if (!this._intentionalClose) {
+        this._doOpen().catch(() => {
+          // _doOpen sets error state; close handler will schedule next retry if needed.
+        });
+      }
+    }, delay);
+  }
+
   close() {
+    this._intentionalClose = true;
+    this._clearReconnectTimer();
     this.ws?.close();
     this.ws = null;
+  }
+
+  private _clearReconnectTimer() {
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
   }
 
   private dispatch(msg: Record<string, unknown>) {
