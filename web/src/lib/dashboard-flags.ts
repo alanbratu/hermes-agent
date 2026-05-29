@@ -7,9 +7,7 @@ declare global {
   }
 }
 
-/** True only when the dashboard was started with embedded TUI Chat (`hermes dashboard --tui`). */
+/** Chat is permanently available in the dashboard; the previous gate on `--tui` flag is removed. */
 export function isDashboardEmbeddedChatEnabled(): boolean {
-  if (typeof window === "undefined") return false;
-  if (window.__HERMES_DASHBOARD_EMBEDDED_CHAT__ === true) return true;
-  return window.__HERMES_DASHBOARD_TUI__ === true;
+  return true;
 }

@@ -10926,7 +10926,8 @@ def cmd_dashboard(args):
 
     from hermes_cli.web_server import start_server
 
-    embedded_chat = args.tui or os.environ.get("HERMES_DASHBOARD_TUI") == "1"
+    # Dashboard Chat is permanently enabled regardless of --tui flag.
+    embedded_chat = True
     start_server(
         host=args.host,
         port=args.port,

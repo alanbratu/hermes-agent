@@ -88,9 +88,8 @@ app = FastAPI(title="Hermes Agent", version=__version__)
 _SESSION_TOKEN = secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
-# In-browser Chat tab (/chat, /api/pty, …).  Off unless ``hermes dashboard --tui``
-# or HERMES_DASHBOARD_TUI=1.  Set from :func:`start_server`.
-_DASHBOARD_EMBEDDED_CHAT_ENABLED = False
+# In-browser Chat tab (/chat, /api/pty, /api/events, …).  Permanently enabled.
+_DASHBOARD_EMBEDDED_CHAT_ENABLED = True
 
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
@@ -4834,7 +4833,7 @@ def start_server(
     import uvicorn
 
     global _DASHBOARD_EMBEDDED_CHAT_ENABLED
-    _DASHBOARD_EMBEDDED_CHAT_ENABLED = embedded_chat
+    _DASHBOARD_EMBEDDED_CHAT_ENABLED = True  # permanently enabled regardless of CLI flag
 
     # Phase 0: stash the auth-gate flag on app.state so middleware / SPA-token
     # injection / WS-auth paths can branch on it consistently.  Phase 3.5

@@ -92,6 +92,37 @@ export default defineConfig({
   build: {
     outDir: "../hermes_cli/web_dist",
     emptyOutDir: true,
+    chunkSizeWarningLimit: 500,
+    rollupOptions: {
+      output: {
+        manualChunks: (id: string) => {
+          if (id.includes("node_modules/react/") || id.includes("node_modules/react-dom/")) {
+            return "vendor-react";
+          }
+          if (id.includes("node_modules/react-router") || id.includes("node_modules/@remix-run")) {
+            return "vendor-router";
+          }
+          if (id.includes("node_modules/motion") || id.includes("node_modules/framer-motion")) {
+            return "vendor-motion";
+          }
+          if (id.includes("node_modules/lucide-react")) {
+            return "vendor-icons";
+          }
+          if (id.includes("node_modules/@xterm")) {
+            return "vendor-xterm";
+          }
+          if (id.includes("node_modules/@observablehq")) {
+            return "vendor-plot";
+          }
+          if (id.includes("node_modules/leva") || id.includes("node_modules/gsap") || id.includes("node_modules/radix-ui") || id.includes("node_modules/@radix-ui")) {
+            return "vendor-radix";
+          }
+          if (id.includes("node_modules/@nous-research/ui")) {
+            return "vendor-nous-ui";
+          }
+        },
+      },
+    },
   },
   server: {
     proxy: {
