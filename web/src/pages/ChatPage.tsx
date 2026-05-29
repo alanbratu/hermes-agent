@@ -37,6 +37,7 @@ import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { PluginSlot } from "@/plugins";
 
+// @ts-expect-error legacy URL builder; inlined into reconnect logic
 function buildWsUrl(
   authParam: [string, string],
   resume: string | null,
@@ -112,6 +113,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // PTY reconnect state — additive, non-breaking
+  const retryCountRef = useRef(0);
+  const intentionalCloseRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Exposed to the main metrics-sync effect so it can refit the terminal
   // the moment `isActive` flips back to true (display:none → display:flex
   // collapses the host's box, so ResizeObserver never fires on return).
@@ -556,74 +561,67 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     let unmounting = false;
     let onDataDisposable: { dispose(): void } | null = null;
     let onResizeDisposable: { dispose(): void } | null = null;
-    void (async () => {
+    let urlBase: string | null = null;
+
+    const connectPty = async () => {
       const authParam = await buildWsAuthParam();
-      if (unmounting) return;
-      const url = buildWsUrl(authParam, resumeParam, channel);
+      if (unmounting || !urlBase) return;
+      const url = `${urlBase}&${authParam[0]}=${encodeURIComponent(authParam[1])}`;
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
-    ws.onopen = () => {
-      setBanner(null);
-      // Send the initial RESIZE immediately so Ink has *a* size to lay
-      // out against on its first paint.  The double-rAF block above will
-      // follow up with the authoritative measurement — at worst Ink
-      // reflows once after the PTY boots, which is imperceptible.
-      ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
-    };
+      ws.onopen = () => {
+        retryCountRef.current = 0;
+        intentionalCloseRef.current = false;
+        setBanner(null);
+        ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+      };
 
-    ws.onmessage = (ev) => {
-      if (typeof ev.data === "string") {
-        term.write(ev.data);
-      } else {
-        term.write(new Uint8Array(ev.data as ArrayBuffer));
-      }
-    };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          term.write(ev.data);
+        } else {
+          term.write(new Uint8Array(ev.data as ArrayBuffer));
+        }
+      };
 
-    ws.onclose = (ev) => {
-      wsRef.current = null;
-      if (unmounting) {
-        return;
-      }
-      if (ev.code === 4401) {
-        setBanner("Auth failed. Reload the page to refresh the session token.");
-        return;
-      }
-      if (ev.code === 4403) {
-        setBanner("Chat is only reachable from localhost.");
-        return;
-      }
-      if (ev.code === 1011) {
-        // Server already wrote an ANSI error frame.
-        return;
-      }
-      term.write("\r\n\x1b[90m[session ended]\x1b[0m\r\n");
-    };
-
-    // Keystrokes → PTY.
-    //
-    // IMPORTANT:
-    // The embedded web chat has occasionally surfaced stray letters/digits
-    // in the input line after a turn completes. The most likely culprit is
-    // browser-side terminal control traffic being forwarded back into the
-    // PTY as if it were user text. SGR mouse tracking is the highest-risk
-    // path here: xterm.js emits raw CSI reports (`\x1b[<...`) that look like
-    // ordinary bytes to the backend.
-    //
-    // For the browser embed we prefer input stability over terminal-style
-    // mouse reporting, so we drop SGR mouse reports entirely instead of
-    // forwarding them into Hermes. Keyboard input, paste, and resize still
-    // behave normally.
-      // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
-      const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
-      onDataDisposable = term.onData((data) => {
-        if (ws.readyState !== WebSocket.OPEN) return;
-
-        if (SGR_MOUSE_RE.test(data)) {
+      ws.onclose = (ev) => {
+        wsRef.current = null;
+        if (unmounting) return;
+        if (intentionalCloseRef.current) return;
+        if (ev.code === 4401) {
+          setBanner("Auth failed. Reload the page to refresh the session token.");
+          return;
+        }
+        if (ev.code === 4403) {
+          setBanner("Chat is only reachable from localhost.");
+          return;
+        }
+        if (ev.code === 1011) {
+          // Server already wrote an ANSI error frame.
           return;
         }
 
+        // transient close → show recovering banner + attempt reconnect
+        setBanner("Reconnecting…");
+        if (retryCountRef.current < 10) {
+          retryCountRef.current += 1;
+          const delay = Math.min(1000 * Math.pow(2, retryCountRef.current - 1), 30000);
+          reconnectTimerRef.current = setTimeout(() => {
+            reconnectTimerRef.current = null;
+            connectPty();
+          }, delay);
+        } else {
+          term.write("\r\n\x1b[90m[connection lost — reload page to retry]\x1b[0m\r\n");
+          setBanner("Connection lost. Reload the page.");
+        }
+      };
+
+      const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
+      onDataDisposable = term.onData((data) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        if (SGR_MOUSE_RE.test(data)) return;
         ws.send(data);
       });
 
@@ -632,6 +630,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           ws.send(`\x1b[RESIZE:${cols};${rows}]`);
         }
       });
+    };
+
+    void (async () => {
+      if (unmounting) return;
+      // stash the base URL (without token so reconnect gets a fresh one)
+      const qs = new URLSearchParams({ channel });
+      if (resumeParam) qs.set("resume", resumeParam);
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      urlBase = `${proto}//${window.location.host}${HERMES_BASE_PATH}/api/pty?${qs.toString()}`;
+      await connectPty();
     })();
 
     term.focus();
@@ -651,11 +659,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (hostSyncRaf) cancelAnimationFrame(hostSyncRaf);
       if (settleRaf1) cancelAnimationFrame(settleRaf1);
       if (settleRaf2) cancelAnimationFrame(settleRaf2);
-      // Phase 5.3: ``ws`` is local to the IIFE that opens it (the gated-mode
-      // ticket fetch makes the open async). The cleanup runs at the outer
-      // effect's top level so it can't reach into that scope — close via
-      // the ref instead. ``?.`` covers the race where unmount fires before
-      // the ticket fetch resolves and ``wsRef.current`` was never assigned.
+      // Phase 5.3: close via the ref. Intentional — abort any pending reconnect.
+      intentionalCloseRef.current = true;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       wsRef.current?.close();
       wsRef.current = null;
       term.dispose();

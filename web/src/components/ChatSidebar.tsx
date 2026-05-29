@@ -52,6 +52,7 @@ const TOOL_LIMIT = 20;
 
 const STATE_LABEL: Record<ConnectionState, string> = {
   idle: "idle",
+  reconnecting: "reconnecting",
   connecting: "connecting",
   open: "live",
   closed: "closed",
@@ -63,6 +64,7 @@ const STATE_TONE: Record<
   "secondary" | "warning" | "success" | "destructive"
 > = {
   idle: "secondary",
+  reconnecting: "warning",
   connecting: "warning",
   open: "success",
   closed: "secondary",
